@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+exclude = ["apps/desktop/src-tauri"]
+
+# NOTE: apps/desktop/src-tauri is intentionally NOT a workspace member.
+# It requires OS WebView SDKs and is built in CI (Win/Mac) or via
+# `cargo build` inside apps/desktop/src-tauri. See apps/desktop/README.md.

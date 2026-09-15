@@ -1,0 +1,6 @@
+{
+  "name": "hello-python",
+  "version": "0.1.0",
+  "description": "反転エフェクトのサンプル（Python標準ライブラリのみ）",
+  "kind": { "type": "command", "program": "python3", "args": ["plugin.py"] }
+}

@@ -1,0 +1,17 @@
+[package]
+name = "pool-render-core"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "wgpu + WGSL ベースのシーンレンダラ（ヘッドレス可）"
+
+[dependencies]
+pool-timeline-model = { path = "../timeline-model" }
+wgpu = "26"
+pollster = "0.4"
+ab_glyph = "0.2"
+bytemuck = { version = "1", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[dev-dependencies]
+pool-ffmpeg-io = { path = "../ffmpeg-io" }

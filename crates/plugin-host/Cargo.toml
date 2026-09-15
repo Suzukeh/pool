@@ -1,0 +1,11 @@
+[package]
+name = "pool-plugin-host"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "pool 別プロセスプラグインの起動・描画・監視"
+
+[dependencies]
+pool-plugin-sdk = { path = "../plugin-sdk" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

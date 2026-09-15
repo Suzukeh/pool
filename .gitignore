@@ -1,0 +1,30 @@
+# Rust
+target/
+# ライブラリの lock は除外するが、バイナリ(src-tauri)の lock は再現性のため残す
+Cargo.lock
+!apps/desktop/src-tauri/Cargo.lock
+**/*.rs.bk
+
+# Node / frontend
+node_modules/
+apps/desktop/dist/
+apps/desktop/.vite/
+*.local
+
+# Tauri
+apps/desktop/src-tauri/target/
+*.app
+*.dmg
+*.msi
+*.exe
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# Local config / secrets
+*.env
+ProgramData/
