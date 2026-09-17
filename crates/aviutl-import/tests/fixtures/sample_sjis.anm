@@ -1,0 +1,3 @@
+--track0:‘å‚«‚³,0,200,100,1
+--check0:—LŒø,1
+obj.zoom = obj.track0 / 100

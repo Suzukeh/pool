@@ -228,3 +228,166 @@ fn png_output_is_valid() {
     let img = image::load_from_memory(&png).unwrap();
     assert_eq!((img.width(), img.height()), (160, 90));
 }
+
+#[test]
+fn rotation_turns_bar_vertical() {
+    let Some(mut r) = renderer_or_skip() else {
+        return;
+    };
+    let mut base = rect("a", 0, 90, 160.0, 90.0, 200.0, 100.0, RED);
+    base.params.push(Param {
+        name: "rotation".to_string(),
+        value: Value::Number(90.0),
+    });
+    let mut p = Project::new("t");
+    p.scenes[0].layers[0].objects.push(base);
+    let rgba = r.render_scene(&p.scenes[0], 10, 320, 180).unwrap();
+    // 90°回転で縦棒になる：真上(160,30)は入り、右(250,90)は抜ける
+    assert!(
+        near(px(&rgba, 320, 160, 30), [255, 0, 0, 255], 12),
+        "top should fill"
+    );
+    assert!(
+        near(px(&rgba, 320, 250, 90), [0, 0, 0, 255], 12),
+        "right should clear"
+    );
+}
+
+#[test]
+fn japanese_text_renders_with_system_font() {
+    let Some(mut r) = renderer_or_skip() else {
+        return;
+    };
+    let mut p = Project::new("t");
+    p.scenes[0].layers[0].objects.push(TimelineObject {
+        id: "jp".to_string(),
+        name: "jp".to_string(),
+        kind: ObjectKind::Text {
+            body: "こんにちは".to_string(),
+        },
+        start_frame: 0,
+        end_frame: 90,
+        params: vec![
+            Param {
+                name: "x".to_string(),
+                value: Value::Number(240.0),
+            },
+            Param {
+                name: "y".to_string(),
+                value: Value::Number(135.0),
+            },
+            Param {
+                name: "size".to_string(),
+                value: Value::Number(64.0),
+            },
+        ],
+        keyframes: vec![],
+        loops: Default::default(),
+    });
+    let rgba = r.render_scene(&p.scenes[0], 10, 480, 270).unwrap();
+    let ink = rgba.chunks_exact(4).filter(|p| p[3] > 128).count();
+    // tofu（.notdef の箱）でもインクは出るため、厳密判定は環境変数指定時のみ。
+    // 目安：本物グリフなら 5 文字で数千 px
+    if std::env::var_os("POOL_TEST_REQUIRE_JP").is_some() {
+        assert!(ink > 2000, "japanese ink too small: {ink}");
+    } else {
+        eprintln!("JP ink pixels: {ink} (strict check needs POOL_TEST_REQUIRE_JP=1)");
+    }
+}
+
+#[test]
+fn video_frame_renders() {
+    if pool_ffmpeg_io::find_ffmpeg().is_err() {
+        eprintln!("SKIP: ffmpeg not found");
+        return;
+    }
+    let src = std::env::temp_dir().join(format!("pool-vid-{}.mp4", std::process::id()));
+    let st = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=s=160x90:d=1:r=30",
+            "-pix_fmt",
+            "yuv420p",
+        ])
+        .arg(&src)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let Some(mut r) = renderer_or_skip() else {
+        return;
+    };
+    let mut p = Project::new("t");
+    p.scenes[0].layers[0].objects.push(TimelineObject {
+        id: "v".to_string(),
+        name: "v".to_string(),
+        kind: ObjectKind::Video {
+            path: src.to_string_lossy().into_owned(),
+        },
+        start_frame: 0,
+        end_frame: 30,
+        params: vec![],
+        keyframes: vec![],
+        loops: Default::default(),
+    });
+    let rgba = r.render_scene(&p.scenes[0], 5, 160, 90).unwrap();
+    // testsrc はカラフル：明るいピクセルが多数あるはず
+    let bright = rgba
+        .chunks_exact(4)
+        .filter(|p| p[0] > 100 || p[1] > 100 || p[2] > 100)
+        .count();
+    assert!(
+        bright > 3000,
+        "video should show colorful frame, got {bright}"
+    );
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn perf_100_objects_report() {
+    let Some(mut r) = renderer_or_skip() else {
+        return;
+    };
+    let mut p = Project::new("t");
+    // 100 レイヤー×各1オブジェクト＝100 同時描画（ worst case ）
+    for i in 0..100 {
+        p.scenes[0].layers.push(Layer {
+            id: format!("layer-{i}"),
+            name: format!("Layer{i}"),
+            visible: true,
+            locked: false,
+            objects: vec![rect(
+                &format!("o{i}"),
+                0,
+                90,
+                ((i * 37) % 480) as f64,
+                ((i * 53) % 270) as f64,
+                100.0,
+                100.0,
+                Rgba {
+                    r: 0.5,
+                    g: 0.5,
+                    b: 0.5,
+                    a: 1.0,
+                },
+            )],
+        });
+    }
+    // ウォームアップ
+    let _ = r.render_scene(&p.scenes[0], 10, 480, 270).unwrap();
+    let t0 = std::time::Instant::now();
+    let n = 10;
+    for _ in 0..n {
+        let _ = r.render_scene(&p.scenes[0], 10, 480, 270).unwrap();
+    }
+    let ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
+    eprintln!(
+        "PERF 100 objects @480x270: {ms:.1}ms/frame ({:.1}fps)",
+        1000.0 / ms
+    );
+    assert!(ms < 10_000.0, "absurdly slow: {ms}ms");
+}

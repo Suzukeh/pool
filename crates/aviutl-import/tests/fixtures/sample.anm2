@@ -1,0 +1,13 @@
+@振動
+--track0:X移動,-200,200,0,1
+--track1:Y移動,-200,200,0,1
+--check0:ランダム,0
+--dialog:周期,8
+--color:基準色,FF0000
+--script:luaJIT
+obj.ox = obj.ox + obj.track0
+obj.oy = obj.oy + obj.track1
+@回転
+--track0:角度,-360,360,0,1
+--file:mask.png
+obj.rz = obj.track0

@@ -7,6 +7,7 @@ description = "wgpu + WGSL ベースのシーンレンダラ（ヘッドレス�
 
 [dependencies]
 pool-timeline-model = { path = "../timeline-model" }
+pool-ffmpeg-io = { path = "../ffmpeg-io" }
 wgpu = "26"
 pollster = "0.4"
 ab_glyph = "0.2"

@@ -5,6 +5,7 @@
 
 pub mod renderer;
 pub mod text;
+pub mod video;
 
 pub use renderer::{RenderError, Renderer};
 pub use text::{TextBitmap, rasterize};

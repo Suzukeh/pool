@@ -4,10 +4,12 @@
 //! スクラッチに描いて効果をかけてから over 合成する。
 
 use crate::text;
+use crate::video::VideoSource;
 use ab_glyph::FontRef;
 use pool_timeline_model::{Frame, ObjectKind, Rgba, Scene, ShapeKind, TimelineObject};
 use std::collections::HashMap;
 use std::fmt;
+use wgpu::util::DeviceExt;
 
 #[derive(Debug)]
 pub enum RenderError {
@@ -35,11 +37,13 @@ const MODE_BLIT: u32 = 1;
 const MODE_BRIGHT: u32 = 2;
 const MODE_BLUR: u32 = 3;
 const MODE_OVER: u32 = 4;
+const MODE_SHAPE_DIRECT: u32 = 5;
+const MODE_BLIT_DIRECT: u32 = 6;
 
 const SHAPE_RECT: u32 = 0;
 const SHAPE_ELLIPSE: u32 = 1;
 
-/// WGSL `U` と一致させること（96 bytes）。
+/// WGSL `U` と一致させること（112 bytes）。
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct U {
@@ -56,6 +60,9 @@ struct U {
     blur_dir: [f32; 2],
     _pad1: [f32; 2],
     uv_rect: [f32; 4],
+    rotation: f32,
+    _pad2: f32,
+    anchor: [f32; 2],
 }
 
 impl U {
@@ -74,6 +81,9 @@ impl U {
             blur_dir: [0.0, 0.0],
             _pad1: [0.0, 0.0],
             uv_rect: [0.0, 0.0, 1.0, 1.0],
+            rotation: 0.0,
+            _pad2: 0.0,
+            anchor: [0.0, 0.0],
         }
     }
 }
@@ -97,10 +107,14 @@ pub struct Renderer {
     pipeline_blend: wgpu::RenderPipeline,
     bgl: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
-    uniform: wgpu::Buffer,
     dummy: wgpu::TextureView,
-    font: FontRef<'static>,
+    fonts: Vec<FontRef<'static>>,
     text_cache: HashMap<(String, u32), (wgpu::Texture, u32, u32)>,
+    videos: HashMap<String, VideoSource>,
+    stills: HashMap<String, (u32, u32, Vec<u8>)>,
+    failed_media: std::collections::HashSet<String>,
+    /// フレーム内一時テクスチャ（描画完了まで保持）。
+    transient: Vec<wgpu::Texture>,
 }
 
 fn adapter_for(backends: wgpu::Backends) -> Option<wgpu::Adapter> {
@@ -254,16 +268,12 @@ impl Renderer {
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
         });
-        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("pool uniform"),
-            size: std::mem::size_of::<U>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         let dummy = Self::make_texture(&device, 1, 1);
         device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let font = FontRef::try_from_slice(include_bytes!("../assets/DejaVuSans.ttf"))
-            .map_err(|e| RenderError::Device(format!("font: {e:?}")))?;
+        let fonts = text::load_font_stack();
+        if fonts.is_empty() {
+            return Err(RenderError::Device("no fonts available".to_string()));
+        }
 
         Ok(Self {
             device,
@@ -272,10 +282,13 @@ impl Renderer {
             pipeline_blend,
             bgl,
             sampler,
-            uniform,
             dummy: dummy.1,
-            font,
+            fonts,
             text_cache: HashMap::new(),
+            videos: HashMap::new(),
+            stills: HashMap::new(),
+            failed_media: std::collections::HashSet::new(),
+            transient: Vec::new(),
         })
     }
 
@@ -301,14 +314,19 @@ impl Renderer {
         (tex, view)
     }
 
-    fn bind(&self, src: &wgpu::TextureView, extra: &wgpu::TextureView) -> wgpu::BindGroup {
+    fn bind(
+        &self,
+        uniform: &wgpu::Buffer,
+        src: &wgpu::TextureView,
+        extra: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("pool pass bg"),
             layout: &self.bgl,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: self.uniform.as_entire_binding(),
+                    resource: uniform.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -328,8 +346,11 @@ impl Renderer {
 
     /// 1 パス実行。`clear` 指定時はクリアのみ（描画なし）。
     /// `blend` 指定時はハードブレンドパイプライン（最終合成用）。
+    /// submit は呼び出し側でまとめて行う（M2 性能対策）。
+    #[allow(clippy::too_many_arguments)]
     fn run_pass(
         &self,
+        enc: &mut wgpu::CommandEncoder,
         dst: &wgpu::TextureView,
         src: &wgpu::TextureView,
         extra: &wgpu::TextureView,
@@ -337,14 +358,14 @@ impl Renderer {
         clear: Option<wgpu::Color>,
         blend: bool,
     ) {
-        self.queue
-            .write_buffer(&self.uniform, 0, bytemuck::bytes_of(u));
-        let bg = self.bind(src, extra);
-        let mut enc = self
+        let uniform = self
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("pool pass"),
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("pool uniform"),
+                contents: bytemuck::bytes_of(u),
+                usage: wgpu::BufferUsages::UNIFORM,
             });
+        let bg = self.bind(&uniform, src, extra);
         {
             let ops = match clear {
                 Some(c) => wgpu::Operations {
@@ -378,7 +399,6 @@ impl Renderer {
                 rp.draw(0..3, 0..1);
             }
         }
-        self.queue.submit(Some(enc.finish()));
     }
 
     fn upload_rgba(&self, w: u32, h: u32, rgba: &[u8]) -> (wgpu::Texture, wgpu::TextureView) {
@@ -405,10 +425,58 @@ impl Renderer {
         (tex, view)
     }
 
+    /// 動画フレーム取得（デコード＋キャッシュ）。失敗は記録して None。
+    fn video_frame(&mut self, path: &str, frame: Frame) -> Option<(u32, u32, Vec<u8>)> {
+        if self.failed_media.contains(path) {
+            return None;
+        }
+        if !self.videos.contains_key(path) {
+            match VideoSource::open(path) {
+                Ok(src) => {
+                    self.videos.insert(path.to_string(), src);
+                }
+                Err(e) => {
+                    eprintln!("pool: video open failed ({path}): {e}");
+                    self.failed_media.insert(path.to_string());
+                    return None;
+                }
+            }
+        }
+        let src = self.videos.get_mut(path).unwrap();
+        let (w, h) = (src.info.width, src.info.height);
+        match src.frame_bytes(frame) {
+            Ok(b) => Some((w, h, b.to_vec())),
+            Err(e) => {
+                eprintln!("pool: video decode failed ({path} f{frame}): {e}");
+                self.failed_media.insert(path.to_string());
+                None
+            }
+        }
+    }
+
+    fn still_bytes(&mut self, path: &str) -> Option<(u32, u32, Vec<u8>)> {
+        if self.failed_media.contains(path) {
+            return None;
+        }
+        if !self.stills.contains_key(path) {
+            match crate::video::decode_still(path) {
+                Ok(v) => {
+                    self.stills.insert(path.to_string(), v);
+                }
+                Err(e) => {
+                    eprintln!("pool: image decode failed ({path}): {e}");
+                    self.failed_media.insert(path.to_string());
+                    return None;
+                }
+            }
+        }
+        self.stills.get(path).cloned()
+    }
+
     fn text_view(&mut self, body: &str, size_px: u32) -> (wgpu::TextureView, u32, u32) {
         let key = (body.to_string(), size_px);
         if !self.text_cache.contains_key(&key) {
-            let bmp = text::rasterize(&self.font, body, size_px as f32);
+            let bmp = text::rasterize(&self.fonts, body, size_px as f32);
             let (tex, _) = self.upload_rgba(bmp.width, bmp.height, &bmp.rgba);
             self.text_cache
                 .insert(key.clone(), (tex, bmp.width, bmp.height));
@@ -435,6 +503,8 @@ impl Renderer {
     ) -> Result<Vec<u8>, RenderError> {
         let w = width.max(1) as f32;
         let h = height.max(1) as f32;
+        // 前フレームの一時テクスチャを解放（readback の poll 済み＝GPU 使用完了）
+        self.transient.clear();
         let (comp_tex, comp_view) = Self::make_texture(&self.device, width.max(1), height.max(1));
         let (_scratch_tex, scratch_view) =
             Self::make_texture(&self.device, width.max(1), height.max(1));
@@ -444,7 +514,13 @@ impl Renderer {
 
         let bg = scene.bg_color;
         let u = U::base(w, h, MODE_SHAPE);
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("pool frame"),
+            });
         self.run_pass(
+            &mut enc,
             &comp_view,
             &comp_view,
             &self.dummy,
@@ -469,6 +545,7 @@ impl Renderer {
                 }
                 if o.contains(frame) {
                     self.draw_object(
+                        &mut enc,
                         o,
                         scene,
                         frame,
@@ -488,17 +565,21 @@ impl Renderer {
             for o in &layer.objects {
                 if o.contains(frame) {
                     if let ObjectKind::Filter { .. } = &o.kind {
-                        self.apply_filter(o, frame, &comp_view, &tmp_view, w, h);
+                        self.apply_filter(&mut enc, o, frame, &comp_view, &tmp_view, w, h);
                     }
                 }
             }
         }
 
-        self.readback(&comp_tex, width.max(1), height.max(1))
+        let (buf, padded) = self.readback_buffer(&mut enc, &comp_tex, width.max(1), height.max(1));
+        self.queue.submit(Some(enc.finish()));
+        self.readback_map(&buf, width.max(1), height.max(1), padded)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn apply_filter(
         &self,
+        enc: &mut wgpu::CommandEncoder,
         o: &TimelineObject,
         frame: Frame,
         comp: &wgpu::TextureView,
@@ -513,15 +594,15 @@ impl Renderer {
                     if b != 0.0 {
                         let mut u = U::base(w, h, MODE_BRIGHT);
                         u.brightness = b;
-                        self.run_pass(tmp, comp, &self.dummy, &u, None, false);
+                        self.run_pass(enc, tmp, comp, &self.dummy, &u, None, false);
                         // tmp → comp へ上書き相当（全面 over、不透明なので実質コピー）
-                        self.blit_over(comp, tmp, w, h);
+                        self.blit_over(enc, comp, tmp, w, h);
                     }
                 }
                 "blur" => {
                     let r = o.eval_number("blur", frame, 0.0) as f32;
                     if r > 0.0 {
-                        self.blur_into(comp, tmp, w, h, r);
+                        self.blur_into(enc, comp, tmp, w, h, r);
                     }
                 }
                 _ => {}
@@ -530,13 +611,21 @@ impl Renderer {
     }
 
     /// src 全面を dst に over 合成（ハードブレンド）。
-    fn blit_over(&self, dst: &wgpu::TextureView, src: &wgpu::TextureView, w: f32, h: f32) {
+    fn blit_over(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        dst: &wgpu::TextureView,
+        src: &wgpu::TextureView,
+        w: f32,
+        h: f32,
+    ) {
         let u = U::base(w, h, MODE_OVER);
-        self.run_pass(dst, &self.dummy, src, &u, None, true);
+        self.run_pass(enc, dst, &self.dummy, src, &u, None, true);
     }
 
     fn blur_into(
         &self,
+        enc: &mut wgpu::CommandEncoder,
         comp: &wgpu::TextureView,
         tmp: &wgpu::TextureView,
         w: f32,
@@ -546,16 +635,17 @@ impl Renderer {
         let mut uh = U::base(w, h, MODE_BLUR);
         uh.blur_radius = radius;
         uh.blur_dir = [1.0, 0.0];
-        self.run_pass(tmp, comp, &self.dummy, &uh, None, false);
+        self.run_pass(enc, tmp, comp, &self.dummy, &uh, None, false);
         let mut uv = U::base(w, h, MODE_BLUR);
         uv.blur_radius = radius;
         uv.blur_dir = [0.0, 1.0];
-        self.run_pass(comp, tmp, &self.dummy, &uv, None, false);
+        self.run_pass(enc, comp, tmp, &self.dummy, &uv, None, false);
     }
 
     #[allow(clippy::too_many_arguments)]
     fn draw_object(
         &mut self,
+        enc: &mut wgpu::CommandEncoder,
         o: &TimelineObject,
         scene: &Scene,
         frame: Frame,
@@ -571,17 +661,26 @@ impl Renderer {
             ObjectKind::Audio { .. } => return Ok(()),
             ObjectKind::GroupControl { .. } | ObjectKind::CameraControl { .. } => return Ok(()), // M3
             ObjectKind::Duplicator { source } => {
-                return self
-                    .draw_duplicator(o, source, scene, frame, w, h, comp, scratch, scratch2, tmp);
+                return self.draw_duplicator(
+                    enc, o, source, scene, frame, w, h, comp, scratch, scratch2, tmp,
+                );
             }
             _ => {}
         }
         let Some(p) = self.resolve_paint(o, frame, w, h, 0.0, 0.0, 0) else {
             return Ok(());
         };
+        // 効果なしは直接合成の高速路（1 パス）
+        let plain = o.eval_number("brightness", frame, 0.0) == 0.0
+            && o.eval_number("blur", frame, 0.0) == 0.0;
+        if plain {
+            self.paint(enc, &p, w, h, comp, &self.dummy, true);
+            return Ok(());
+        }
         // スクラッチを透明クリア（src=dummy で自己参照を避ける）
         let clear = U::base(w, h, MODE_SHAPE);
         self.run_pass(
+            enc,
             scratch,
             &self.dummy,
             &self.dummy,
@@ -594,8 +693,8 @@ impl Renderer {
             }),
             false,
         );
-        self.paint(&p, w, h, scratch, &self.dummy);
-        self.finish_drawable(o, frame, w, h, comp, scratch, tmp);
+        self.paint(enc, &p, w, h, scratch, &self.dummy, false);
+        self.finish_drawable(enc, o, frame, w, h, comp, scratch, tmp);
         Ok(())
     }
 }
@@ -610,6 +709,8 @@ enum Paint {
         cy: f32,
         sw: f32,
         sh: f32,
+        rotation: f32,
+        anchor: [f32; 2],
     },
     Blit {
         view: wgpu::TextureView,
@@ -620,6 +721,8 @@ enum Paint {
         cx: f32,
         cy: f32,
         scale: f32,
+        rotation: f32,
+        anchor: [f32; 2],
     },
 }
 
@@ -654,6 +757,7 @@ impl Renderer {
         let cy = o.eval_number("y", frame, (h / 2.0) as f64) as f32 + dy + wy;
         let scale = o.eval_number("scale", frame, 1.0) as f32;
         let opacity = o.eval_number("opacity", frame, 1.0) as f32;
+        let (rotation, anchor) = Self::transform(o, frame);
         match &o.kind {
             ObjectKind::Shape { shape } => {
                 let (dw, dh) = match shape {
@@ -671,6 +775,8 @@ impl Renderer {
                     cy,
                     sw: o.eval_number("w", frame, dw) as f32 * scale,
                     sh: o.eval_number("h", frame, dh) as f32 * scale,
+                    rotation,
+                    anchor,
                 })
             }
             ObjectKind::Text { body } => {
@@ -685,26 +791,71 @@ impl Renderer {
                     cx,
                     cy,
                     scale,
+                    rotation,
+                    anchor,
                 })
             }
-            ObjectKind::Video { .. } | ObjectKind::Image { .. } => {
-                // M2 スタブ：スレート色矩形（デコードは M5）
-                Some(Paint::Shape {
-                    shape: SHAPE_RECT,
-                    color: [0.23, 0.27, 0.34, 1.0],
+            ObjectKind::Video { path } => {
+                let (vw, vh, bytes) = self.video_frame(path, frame)?;
+                let (tex, view) = self.upload_rgba(vw, vh, &bytes);
+                let (tw, th) = (vw as f32, vh as f32);
+                self.transient.push(tex);
+                Some(Paint::Blit {
+                    view,
+                    tw,
+                    th,
+                    color: [1.0, 1.0, 1.0, 1.0],
                     opacity,
                     cx,
                     cy,
-                    sw: o.eval_number("w", frame, 640.0) as f32 * scale,
-                    sh: o.eval_number("h", frame, 360.0) as f32 * scale,
+                    scale,
+                    rotation,
+                    anchor,
+                })
+            }
+            ObjectKind::Image { path } => {
+                let (iw, ih, bytes) = self.still_bytes(path)?;
+                let (tex, view) = self.upload_rgba(iw, ih, &bytes);
+                let (tw, th) = (iw as f32, ih as f32);
+                self.transient.push(tex);
+                Some(Paint::Blit {
+                    view,
+                    tw,
+                    th,
+                    color: [1.0, 1.0, 1.0, 1.0],
+                    opacity,
+                    cx,
+                    cy,
+                    scale,
+                    rotation,
+                    anchor,
                 })
             }
             _ => None,
         }
     }
 
-    /// 描画内容を dst に over（src は下地）。同一テクスチャ禁止。
-    fn paint(&self, p: &Paint, w: f32, h: f32, dst: &wgpu::TextureView, src: &wgpu::TextureView) {
+    /// 回転 deg→rad と基準点（中心からの px オフセット）。
+    fn transform(o: &TimelineObject, frame: Frame) -> (f32, [f32; 2]) {
+        let rot = o.eval_number("rotation", frame, 0.0) as f32 * std::f32::consts::PI / 180.0;
+        let ax = o.eval_number("anchor_x", frame, 0.0) as f32;
+        let ay = o.eval_number("anchor_y", frame, 0.0) as f32;
+        (rot, [ax, ay])
+    }
+
+    /// 描画内容を dst に出す。direct=true ならブレンドパイプラインで
+    /// 直接合成（効果なしオブジェクトの高速路）、false なら手動 over。
+    #[allow(clippy::too_many_arguments)]
+    fn paint(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        p: &Paint,
+        w: f32,
+        h: f32,
+        dst: &wgpu::TextureView,
+        src: &wgpu::TextureView,
+        direct: bool,
+    ) {
         match p {
             Paint::Shape {
                 shape,
@@ -714,14 +865,26 @@ impl Renderer {
                 cy,
                 sw,
                 sh,
+                rotation,
+                anchor,
             } => {
-                let mut u = U::base(w, h, MODE_SHAPE);
+                let mut u = U::base(
+                    w,
+                    h,
+                    if direct {
+                        MODE_SHAPE_DIRECT
+                    } else {
+                        MODE_SHAPE
+                    },
+                );
                 u.shape = *shape;
                 u.color = *color;
                 u.opacity = *opacity;
                 u.center = [*cx, *cy];
                 u.size = [*sw, *sh];
-                self.run_pass(dst, src, &self.dummy, &u, None, false);
+                u.rotation = *rotation;
+                u.anchor = *anchor;
+                self.run_pass(enc, dst, src, &self.dummy, &u, None, direct);
             }
             Paint::Blit {
                 view,
@@ -732,13 +895,17 @@ impl Renderer {
                 cx,
                 cy,
                 scale,
+                rotation,
+                anchor,
             } => {
-                let mut u = U::base(w, h, MODE_BLIT);
+                let mut u = U::base(w, h, if direct { MODE_BLIT_DIRECT } else { MODE_BLIT });
                 u.color = *color;
                 u.opacity = *opacity;
                 u.center = [*cx, *cy];
                 u.size = [tw * scale, th * scale];
-                self.run_pass(dst, src, view, &u, None, false);
+                u.rotation = *rotation;
+                u.anchor = *anchor;
+                self.run_pass(enc, dst, src, view, &u, None, direct);
             }
         }
     }
@@ -746,6 +913,7 @@ impl Renderer {
     #[allow(clippy::too_many_arguments)]
     fn draw_duplicator(
         &mut self,
+        enc: &mut wgpu::CommandEncoder,
         o: &TimelineObject,
         source: &str,
         scene: &Scene,
@@ -784,6 +952,7 @@ impl Renderer {
             a: 0.0,
         });
         self.run_pass(
+            enc,
             scratch,
             &self.dummy,
             &self.dummy,
@@ -792,6 +961,7 @@ impl Renderer {
             false,
         );
         self.run_pass(
+            enc,
             scratch2,
             &self.dummy,
             &self.dummy,
@@ -823,16 +993,16 @@ impl Renderer {
                 } else {
                     (scratch2, scratch)
                 };
-                self.paint(&p, w, h, wr, rd);
+                self.paint(enc, &p, w, h, wr, rd, false);
                 read_is_scratch = !read_is_scratch;
                 drawn += 1;
             }
         }
         // 最終内容を scratch に集約
         if drawn % 2 == 1 {
-            self.blit_over(scratch, scratch2, w, h);
+            self.blit_over(enc, scratch, scratch2, w, h);
         }
-        self.finish_drawable(o, frame, w, h, comp, scratch, tmp);
+        self.finish_drawable(enc, o, frame, w, h, comp, scratch, tmp);
         Ok(())
     }
 
@@ -840,6 +1010,7 @@ impl Renderer {
     #[allow(clippy::too_many_arguments)]
     fn finish_drawable(
         &self,
+        enc: &mut wgpu::CommandEncoder,
         o: &TimelineObject,
         frame: Frame,
         w: f32,
@@ -852,22 +1023,23 @@ impl Renderer {
         if b != 0.0 {
             let mut u = U::base(w, h, MODE_BRIGHT);
             u.brightness = b;
-            self.run_pass(tmp, scratch, &self.dummy, &u, None, false);
-            self.blit_over(scratch, tmp, w, h);
+            self.run_pass(enc, tmp, scratch, &self.dummy, &u, None, false);
+            self.blit_over(enc, scratch, tmp, w, h);
         }
         let r = o.eval_number("blur", frame, 0.0) as f32;
         if r > 0.0 {
-            self.blur_into(scratch, tmp, w, h, r);
+            self.blur_into(enc, scratch, tmp, w, h, r);
         }
-        self.blit_over(comp, scratch, w, h);
+        self.blit_over(enc, comp, scratch, w, h);
     }
 
-    fn readback(
+    fn readback_buffer(
         &self,
+        enc: &mut wgpu::CommandEncoder,
         texture: &wgpu::Texture,
         width: u32,
         height: u32,
-    ) -> Result<Vec<u8>, RenderError> {
+    ) -> (wgpu::Buffer, u32) {
         let padded = (width * 4).div_ceil(256) * 256;
         let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("pool readback"),
@@ -875,11 +1047,6 @@ impl Renderer {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        let mut enc = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("pool copy"),
-            });
         enc.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture,
@@ -901,8 +1068,16 @@ impl Renderer {
                 depth_or_array_layers: 1,
             },
         );
-        self.queue.submit(Some(enc.finish()));
+        (buf, padded)
+    }
 
+    fn readback_map(
+        &self,
+        buf: &wgpu::Buffer,
+        width: u32,
+        height: u32,
+        padded: u32,
+    ) -> Result<Vec<u8>, RenderError> {
         let slice = buf.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {

@@ -14,6 +14,9 @@ interface ParamDef {
 const COMMON: ParamDef[] = [
   { name: "x", label: "X", type: "number", step: 1 },
   { name: "y", label: "Y", type: "number", step: 1 },
+  { name: "rotation", label: "回転°", type: "number", min: -720, max: 720, step: 1 },
+  { name: "anchor_x", label: "基点X", type: "number", step: 1 },
+  { name: "anchor_y", label: "基点Y", type: "number", step: 1 },
   { name: "scale", label: "拡大率", type: "number", min: 0.01, max: 10, step: 0.01 },
   { name: "opacity", label: "透明度", type: "number", min: 0, max: 1, step: 0.01 },
 ];

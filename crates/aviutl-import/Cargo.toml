@@ -1,0 +1,12 @@
+[package]
+name = "pool-aviutl-import"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "AviUtl スクリプト（.anm/.obj 等）の読込と pool 変換（実行エンジンは将来）"
+
+[dependencies]
+pool-timeline-model = { path = "../timeline-model" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+encoding_rs = "0.8"

@@ -2837,6 +2837,7 @@ dependencies = [
  "bytemuck",
  "image",
  "pollster",
+ "pool-ffmpeg-io",
  "pool-timeline-model",
  "wgpu",
 ]

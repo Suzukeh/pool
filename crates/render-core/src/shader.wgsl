@@ -16,6 +16,9 @@ struct U {
     blur_dir: vec2<f32>,
     _pad1: vec2<f32>,
     uv_rect: vec4<f32>,
+    rotation: f32,
+    _pad2: f32,
+    anchor: vec2<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: U;
@@ -38,13 +41,20 @@ fn over(fg: vec4<f32>, bg: vec4<f32>) -> vec4<f32> {
     return fg + bg * (1.0 - fg.a);
 }
 
+fn rot_pos(pos: vec2<f32>) -> vec2<f32> {
+    let rel = pos - u.center - u.anchor;
+    let c = cos(u.rotation);
+    let s = sin(u.rotation);
+    return vec2<f32>(c * rel.x + s * rel.y, -s * rel.x + c * rel.y) + u.anchor;
+}
+
 @fragment
 fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let uv = pos.xy / u.resolution;
     let bg = textureSample(src_tex, samp, uv);
     switch u.mode {
         case 0u: {
-            let p = (pos.xy - u.center) / (u.size * 0.5 + vec2<f32>(1e-4));
+            let p = rot_pos(pos.xy) / (u.size * 0.5 + vec2<f32>(1e-4));
             var a: f32 = 0.0;
             if u.shape == 0u {
                 if abs(p.x) <= 1.0 && abs(p.y) <= 1.0 {
@@ -57,7 +67,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             return over(vec4<f32>(u.color.rgb * at, at), bg);
         }
         case 1u: {
-            let local = (pos.xy - u.center) / (u.size + vec2<f32>(1e-4)) + vec2<f32>(0.5);
+            let local = rot_pos(pos.xy) / (u.size + vec2<f32>(1e-4)) + vec2<f32>(0.5);
             if local.x < 0.0 || local.x > 1.0 || local.y < 0.0 || local.y > 1.0 {
                 return bg;
             }
@@ -78,6 +88,30 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 wsum = wsum + w;
             }
             return acc / wsum;
+        }
+        case 5u: {
+            // 図形を直接出力（ブレンドパイプラインで合成）
+            let p = rot_pos(pos.xy) / (u.size * 0.5 + vec2<f32>(1e-4));
+            var a: f32 = 0.0;
+            if u.shape == 0u {
+                if abs(p.x) <= 1.0 && abs(p.y) <= 1.0 {
+                    a = 1.0;
+                }
+            } else {
+                a = 1.0 - smoothstep(0.96, 1.0, length(p));
+            }
+            let at = u.color.a * a * u.opacity;
+            return vec4<f32>(u.color.rgb * at, at);
+        }
+        case 6u: {
+            // テクスチャ矩形を直接出力（ブレンドパイプラインで合成）
+            let local = rot_pos(pos.xy) / (u.size + vec2<f32>(1e-4)) + vec2<f32>(0.5);
+            if local.x < 0.0 || local.x > 1.0 || local.y < 0.0 || local.y > 1.0 {
+                return vec4<f32>(0.0);
+            }
+            let t = textureSample(extra_tex, samp, u.uv_rect.xy + local * u.uv_rect.zw);
+            let at = t.a * u.color.a * u.opacity;
+            return vec4<f32>(u.color.rgb * at, at);
         }
         default: {
             // 素材をそのまま出力。合成はブレンドパイプラインに任せる。
