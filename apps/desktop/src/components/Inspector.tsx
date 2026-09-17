@@ -43,6 +43,11 @@ function schemaFor(kind: ObjectKind): ParamDef[] {
         { name: "w", label: "幅", type: "number", min: 1, max: 8000, step: 1 },
         { name: "h", label: "高さ", type: "number", min: 1, max: 8000, step: 1 },
       ];
+    case "audio":
+      return [
+        { name: "volume", label: "音量", type: "number", min: 0, max: 2, step: 0.05 },
+        { name: "offset", label: "開始位置s", type: "number", min: 0, max: 3600, step: 0.1 },
+      ];
     case "filter":
       return kind.effect === "blur"
         ? [{ name: "blur", label: "ぼかし", type: "number", min: 0, max: 100, step: 0.5 }]

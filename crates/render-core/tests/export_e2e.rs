@@ -58,5 +58,45 @@ fn timeline_to_mp4() {
     let info = probe(&out).unwrap();
     assert_eq!((info.width, info.height), (w, h));
     assert!(info.duration_secs > 0.0);
-    let _ = std::fs::remove_file(&out);
+
+    // 音声ミックス＋多重化（export_movie と同手順）
+    let tag = std::process::id();
+    let dir = std::env::temp_dir();
+    let tone = dir.join(format!("pool-e2e-tone-{tag}.m4a"));
+    let st = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=1",
+            "-c:a",
+            "aac",
+        ])
+        .arg(&tone)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let mixed = dir.join(format!("pool-e2e-mix-{tag}.m4a"));
+    let final_mp4 = dir.join(format!("pool-e2e-final-{tag}.mp4"));
+    pool_ffmpeg_io::mix_audio(
+        &[pool_ffmpeg_io::AudioSegment {
+            path: tone.to_string_lossy().into_owned(),
+            start_sec: 0.0,
+            duration_sec: 0.2,
+            offset_sec: 0.0,
+            volume: 1.0,
+        }],
+        &mixed,
+        44100,
+    )
+    .unwrap();
+    pool_ffmpeg_io::mux_av(&out, &mixed, &final_mp4).unwrap();
+    let info = probe(&final_mp4).unwrap();
+    assert!(info.has_video && info.has_audio, "final should have A+V");
+    for p in [&out, &tone, &mixed, &final_mp4] {
+        let _ = std::fs::remove_file(p);
+    }
 }

@@ -305,3 +305,106 @@ pub fn thumbnail(src: &Path, out_png: &Path, width: u32) -> Result<(), FfmpegErr
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// 音声ミックス＋多重化
+// ---------------------------------------------------------------------------
+
+/// タイムライン上の音声区間。
+#[derive(Debug, Clone)]
+pub struct AudioSegment {
+    pub path: String,
+    /// タイムライン上の開始秒。
+    pub start_sec: f64,
+    /// 使用する長さ（秒）。
+    pub duration_sec: f64,
+    /// ファイル内の開始位置（秒）。
+    pub offset_sec: f64,
+    /// 音量（1.0＝等倍）。
+    pub volume: f64,
+}
+
+/// 区間をミックスして AAC にする。空ならエラーを返す。
+pub fn mix_audio(
+    segments: &[AudioSegment],
+    out: &Path,
+    sample_rate: u32,
+) -> Result<(), FfmpegError> {
+    if segments.is_empty() {
+        return Err(FfmpegError::Probe("no audio segments".to_string()));
+    }
+    let ffmpeg = find_ffmpeg()?;
+    let mut cmd = Command::new(ffmpeg);
+    cmd.args(["-y", "-v", "error"]);
+    for seg in segments {
+        cmd.args([
+            "-ss",
+            &format!("{:.3}", seg.offset_sec.max(0.0)),
+            "-t",
+            &format!("{:.3}", seg.duration_sec.max(0.01)),
+            "-i",
+            &seg.path,
+        ]);
+    }
+    let mut filters = Vec::new();
+    let mut mixed = Vec::new();
+    for (i, seg) in segments.iter().enumerate() {
+        let ms = (seg.start_sec.max(0.0) * 1000.0).round() as u64;
+        filters.push(format!(
+            "[{i}:a]adelay={ms}|{ms},volume={:.3},aformat=sample_rates={sample_rate}:channel_layouts=stereo[a{i}]",
+            seg.volume.max(0.0)
+        ));
+        mixed.push(format!("[a{i}]"));
+    }
+    filters.push(format!(
+        "{}amix=inputs={}:duration=longest:dropout_transition=0[aout]",
+        mixed.concat(),
+        segments.len()
+    ));
+    cmd.args(["-filter_complex", &filters.join(";")]);
+    cmd.args([
+        "-map",
+        "[aout]",
+        "-c:a",
+        "aac",
+        "-ar",
+        &sample_rate.to_string(),
+        "-ac",
+        "2",
+    ]);
+    cmd.arg(out);
+    let status = cmd
+        .status()
+        .map_err(|e| FfmpegError::Spawn(e.to_string()))?;
+    if !status.success() {
+        return Err(FfmpegError::Finish(format!("mix status {status}")));
+    }
+    Ok(())
+}
+
+/// 映像 mp4＋音声→多重化（映像はコピー）。
+pub fn mux_av(video: &Path, audio: &Path, out: &Path) -> Result<(), FfmpegError> {
+    let ffmpeg = find_ffmpeg()?;
+    let status = Command::new(ffmpeg)
+        .args([
+            "-y",
+            "-v",
+            "error",
+            "-i",
+            &video.to_string_lossy(),
+            "-i",
+            &audio.to_string_lossy(),
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-shortest",
+        ])
+        .arg(out)
+        .status()
+        .map_err(|e| FfmpegError::Spawn(e.to_string()))?;
+    if !status.success() {
+        return Err(FfmpegError::Finish(format!("mux status {status}")));
+    }
+    Ok(())
+}

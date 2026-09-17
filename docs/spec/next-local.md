@@ -30,3 +30,11 @@
 - 初期：121.6ms（8.2fps）→ 単一 submit＋直接合成で **66ms（15fps)**。
 - 教訓：submit 単位の uniform 共有は誤動作の元（パス毎バッファ化）。
 - 60fps にはバッチ化が必要（将来）。GeForce 実機での再計測待ち。
+
+## C8 音声対応
+
+- Audio オブジェクト：`volume`（0〜2）・`offset`（ファイル内開始秒）。
+- 書出し：無音映像→一時 mp4→`mix_audio`（adelay＋volume＋amix→aac）→
+  `mux_av`（-c:v copy）で多重化。音なしなら従来通り。
+- 取込ダイアログに音声拡張子追加、Inspector に音行。
+- 再生時プレビュー音声は未対応（実機確認後に rodio 等で検討）。

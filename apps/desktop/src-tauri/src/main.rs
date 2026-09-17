@@ -4,7 +4,7 @@ use base64::Engine;
 use pool_ffmpeg_io::MediaInfo;
 use pool_plugin_sdk::Manifest;
 use pool_render_core::Renderer;
-use pool_timeline_model::Project;
+use pool_timeline_model::{ObjectKind, Project};
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -81,6 +81,29 @@ fn probe_media(path: String) -> Result<MediaInfo, String> {
     pool_ffmpeg_io::probe(std::path::Path::new(&path)).map_err(|e| e.to_string())
 }
 
+/// シーンから音声区間を集める（純粋関数・テスト可）。
+fn collect_audio_segments(
+    scene: &pool_timeline_model::Scene,
+    fps: f64,
+) -> Vec<pool_ffmpeg_io::AudioSegment> {
+    let mut segs = Vec::new();
+    for layer in &scene.layers {
+        for o in &layer.objects {
+            if let ObjectKind::Audio { path } = &o.kind {
+                let start_sec = o.start_frame.max(0) as f64 / fps;
+                let dur = (o.end_frame - o.start_frame).max(1) as f64 / fps;
+                segs.push(pool_ffmpeg_io::AudioSegment {
+                    path: path.clone(),
+                    start_sec,
+                    duration_sec: dur,
+                    offset_sec: o.eval_number("offset", o.start_frame, 0.0).max(0.0),
+                    volume: o.eval_number("volume", o.start_frame, 1.0).max(0.0),
+                });
+            }
+        }
+    }
+    segs
+}
 #[derive(Clone, serde::Serialize)]
 struct ExportProgress {
     frame: i64,
@@ -135,14 +158,34 @@ fn export_blocking(
         }
         Ok(dir.to_string_lossy().into_owned())
     } else {
-        let mut writer = pool_ffmpeg_io::Mp4Writer::new(PathBuf::from(out_path).as_path(), w, h, fps)
-            .map_err(|e| e.to_string())?;
+        // 無音映像を一時書出し→音声があればミックスして多重化
+        let tmp_video = format!("{out_path}.video.mp4");
+        let mut writer =
+            pool_ffmpeg_io::Mp4Writer::new(PathBuf::from(&tmp_video).as_path(), w, h, fps)
+                .map_err(|e| e.to_string())?;
         for f in 0..total {
             let rgba = renderer.render_scene(scene, f, w, h).map_err(|e| e.to_string())?;
             writer.write_frame(&rgba).map_err(|e| e.to_string())?;
             on_progress(f + 1, total);
         }
         writer.finish().map_err(|e| e.to_string())?;
+        let segs = collect_audio_segments(scene, fps);
+        if segs.is_empty() {
+            fs::rename(&tmp_video, out_path).map_err(|e| e.to_string())?;
+        } else {
+            let tmp_audio = format!("{out_path}.mix.m4a");
+            pool_ffmpeg_io::mix_audio(&segs, PathBuf::from(&tmp_audio).as_path(), 44100)
+                .map_err(|e| e.to_string())?;
+            pool_ffmpeg_io::mux_av(
+                PathBuf::from(&tmp_video).as_path(),
+                PathBuf::from(&tmp_audio).as_path(),
+                PathBuf::from(out_path).as_path(),
+            )
+            .map_err(|e| e.to_string())?;
+            let _ = fs::remove_file(&tmp_video);
+            let _ = fs::remove_file(&tmp_audio);
+        }
+        on_progress(total, total);
         Ok(out_path.to_string())
     }
 }
@@ -278,4 +321,61 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("failed to run pool");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pool_timeline_model::{Layer, Param, TimelineObject, Value};
+
+    #[test]
+    fn collects_audio_segments_with_timing() {
+        let mut scene = pool_timeline_model::Scene {
+            id: "s".to_string(),
+            name: "S".to_string(),
+            width: 320,
+            height: 180,
+            fps_num: 30,
+            fps_den: 1,
+            sample_rate: 44100,
+            bg_color: pool_timeline_model::Rgba::BLACK,
+            layers: vec![Layer {
+                id: "l".to_string(),
+                name: "L".to_string(),
+                visible: true,
+                locked: false,
+                objects: vec![
+                    TimelineObject {
+                        id: "a".to_string(),
+                        name: "a".to_string(),
+                        kind: ObjectKind::Audio { path: "s.mp3".to_string() },
+                        start_frame: 30,
+                        end_frame: 90,
+                        params: vec![Param {
+                            name: "volume".to_string(),
+                            value: Value::Number(0.5),
+                        }],
+                        keyframes: vec![],
+                        loops: Default::default(),
+                    },
+                    TimelineObject {
+                        id: "v".to_string(),
+                        name: "v".to_string(),
+                        kind: ObjectKind::Video { path: "v.mp4".to_string() },
+                        start_frame: 0,
+                        end_frame: 90,
+                        params: vec![],
+                        keyframes: vec![],
+                        loops: Default::default(),
+                    },
+                ],
+            }],
+        };
+        let segs = collect_audio_segments(&mut scene, 30.0);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].path, "s.mp3");
+        assert!((segs[0].start_sec - 1.0).abs() < 1e-9);
+        assert!((segs[0].duration_sec - 2.0).abs() < 1e-9);
+        assert!((segs[0].volume - 0.5).abs() < 1e-9);
+    }
 }

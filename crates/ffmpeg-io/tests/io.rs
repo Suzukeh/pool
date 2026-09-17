@@ -98,3 +98,77 @@ fn codec_pick_reports_name() {
     let (name, _) = pick_video_codec().unwrap();
     assert!(!name.is_empty());
 }
+
+#[test]
+fn mix_and_mux_audio() {
+    if !available() {
+        eprintln!("SKIP: ffmpeg not found");
+        return;
+    }
+    use pool_ffmpeg_io::{AudioSegment, mix_audio, mux_av};
+    let dir = std::env::temp_dir();
+    let tag = std::process::id();
+    let video = dir.join(format!("pool-a-{tag}.mp4"));
+    let tone = dir.join(format!("pool-a-{tag}.m4a"));
+    let mixed = dir.join(format!("pool-a-{tag}-mix.m4a"));
+    let final_mp4 = dir.join(format!("pool-a-{tag}-final.mp4"));
+    let ffmpeg = find_ffmpeg().unwrap();
+    let run = |args: &[&str]| {
+        assert!(
+            std::process::Command::new(&ffmpeg)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    };
+    run(&[
+        "-y",
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=s=128x72:d=1:r=30",
+        "-pix_fmt",
+        "yuv420p",
+        &video.to_string_lossy(),
+    ]);
+    run(&[
+        "-y",
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:duration=1",
+        "-c:a",
+        "aac",
+        &tone.to_string_lossy(),
+    ]);
+    mix_audio(
+        &[AudioSegment {
+            path: tone.to_string_lossy().into_owned(),
+            start_sec: 0.2,
+            duration_sec: 0.5,
+            offset_sec: 0.0,
+            volume: 0.8,
+        }],
+        &mixed,
+        44100,
+    )
+    .unwrap();
+    let info = probe(&mixed).unwrap();
+    assert!(info.has_audio, "mixed should have audio");
+    assert!(
+        info.duration_secs > 0.6,
+        "mix duration {}",
+        info.duration_secs
+    );
+    mux_av(&video, &mixed, &final_mp4).unwrap();
+    let info = probe(&final_mp4).unwrap();
+    assert!(info.has_video && info.has_audio, "final should have both");
+    for p in [&video, &tone, &mixed, &final_mp4] {
+        let _ = std::fs::remove_file(p);
+    }
+}

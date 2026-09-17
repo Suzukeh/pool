@@ -60,6 +60,13 @@ export default function MediaExplorer({
     if (layerId) dispatch({ type: "add", layerId, kind, name, at });
   };
 
+  const addMedia = (path: string) => {
+    const lower = path.toLowerCase();
+    const isAudio = [".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"].some((e) => lower.endsWith(e));
+    const name = path.split("/").pop() ?? (isAudio ? "audio" : "video");
+    addObject(isAudio ? { type: "audio", path } : { type: "video", path }, name);
+  };
+
   const importMedia = async () => {
     const { open } = await import("@tauri-apps/plugin-dialog");
     const { invoke } = await import("@tauri-apps/api/core");
@@ -68,7 +75,7 @@ export default function MediaExplorer({
         multiple: true,
         directory: false,
         defaultPath: lastDir,
-        filters: [{ name: "動画・画像", extensions: ["mp4", "mov", "mkv", "webm", "png", "jpg", "webp"] }],
+        filters: [{ name: "メディア", extensions: ["mp4", "mov", "mkv", "webm", "png", "jpg", "webp", "mp3", "wav", "m4a", "aac", "ogg", "flac"] }],
       }),
     );
     if (!picked) return;
@@ -128,9 +135,7 @@ export default function MediaExplorer({
             key={m.path}
             className="list-item media-item"
             title="ダブルクリックで再生ヘッド位置に配置"
-            onDoubleClick={() =>
-              addObject({ type: "video", path: m.path }, m.path.split("/").pop() ?? "video")
-            }
+            onDoubleClick={() => addMedia(m.path)}
           >
             {m.thumb && <img className="media-thumb" src={m.thumb} alt="" />}
             <span>{m.path.split("/").pop()}</span>
